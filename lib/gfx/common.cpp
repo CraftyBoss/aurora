@@ -9,6 +9,7 @@
 #include "tex_palette_conv.hpp"
 #include "texture_replacement.hpp"
 #include "texture.hpp"
+#include "../window.hpp"
 
 #include <optional>
 #include <ranges>
@@ -46,15 +47,6 @@ enum class CommandType {
   Draw,
   DebugMarker,
 };
-struct SetScissorCommand {
-  uint32_t x;
-  uint32_t y;
-  uint32_t w;
-  uint32_t h;
-
-  bool operator==(const SetScissorCommand& rhs) const { return x == rhs.x && y == rhs.y && w == rhs.w && h == rhs.h; }
-  bool operator!=(const SetScissorCommand& rhs) const { return !(*this == rhs); }
-};
 struct Command {
   CommandType type;
 #ifdef AURORA_GFX_DEBUG_GROUPS
@@ -62,7 +54,7 @@ struct Command {
 #endif
   union Data {
     Viewport setViewport;
-    SetScissorCommand setScissor;
+    ClipRect setScissor;
     ShaderDrawCommand draw;
     size_t debugMarkerIndex;
   } data;
@@ -95,8 +87,8 @@ struct CachedBindGroup {
   uint32_t lastUsedFrame = 0;
 };
 
-constexpr uint32_t BindGroupCacheRetainFrames = 120;
-constexpr uint32_t BindGroupCacheSweepPeriod = 32;
+constexpr uint32_t BindGroupCacheRetainFrames = 32;
+constexpr uint32_t BindGroupCacheSweepPeriod = 16;
 } // namespace
 
 static absl::flat_hash_map<BindGroupRef, CachedBindGroup> g_cachedBindGroups;
@@ -130,6 +122,7 @@ struct RenderPass {
   wgpu::TextureView depthView;
   wgpu::Texture copySourceTexture;
   wgpu::TextureView copySourceView;
+  wgpu::TextureView copySourceDepthView;
   wgpu::Extent3D targetSize;
   uint32_t msaaSamples = 1;
 
@@ -148,6 +141,8 @@ static std::vector<RenderPass> g_renderPasses;
 static u32 g_currentRenderPass = UINT32_MAX;
 static bool g_inOffscreen = false;
 static std::optional<RenderPass> g_suspendedEfbPass;
+static Viewport g_suspendedEfbViewport;
+static ClipRect g_suspendedEfbScissor;
 static webgpu::TextureWithSampler g_offscreenColor;
 static webgpu::TextureWithSampler g_offscreenDepth;
 
@@ -159,6 +154,7 @@ static void set_efb_targets(RenderPass& pass) {
       webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.texture : webgpu::g_frameBuffer.texture;
   pass.copySourceView =
       webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.view : webgpu::g_frameBuffer.view;
+  pass.copySourceDepthView = webgpu::g_depthBuffer.view;
   pass.targetSize = webgpu::g_frameBuffer.size;
   pass.msaaSamples = webgpu::g_graphicsConfig.msaaSamples;
 }
@@ -212,20 +208,25 @@ static void push_draw_command(ShaderDrawCommand data) {
   ++g_stats.drawCallCount;
 }
 
-static Viewport g_cachedViewport;
-const Viewport& get_viewport() noexcept { return g_cachedViewport; }
+Vec2<uint32_t> get_render_target_size() noexcept {
+  if (g_currentRenderPass < g_renderPasses.size()) {
+    const auto& size = g_renderPasses[g_currentRenderPass].targetSize;
+    return {size.width, size.height};
+  }
+  const auto windowSize = window::get_window_size();
+  return {windowSize.fb_width, windowSize.fb_height};
+}
 
-void set_viewport(float left, float top, float width, float height, float znear, float zfar) noexcept {
-  Viewport cmd{left, top, width, height, znear, zfar};
+static Viewport g_cachedViewport;
+void set_viewport(const Viewport& cmd) noexcept {
   if (cmd != g_cachedViewport) {
     push_command(CommandType::SetViewport, Command::Data{.setViewport = cmd});
     g_cachedViewport = cmd;
   }
 }
 
-static SetScissorCommand g_cachedScissor;
-void set_scissor(uint32_t x, uint32_t y, uint32_t w, uint32_t h) noexcept {
-  SetScissorCommand cmd{x, y, w, h};
+static ClipRect g_cachedScissor;
+void set_scissor(const ClipRect& cmd) noexcept {
   if (cmd != g_cachedScissor) {
     push_command(CommandType::SetScissor, Command::Data{.setScissor = cmd});
     g_cachedScissor = cmd;
@@ -268,6 +269,7 @@ void resolve_pass(TextureHandle texture, ClipRect rect, bool clearColor, bool cl
       .depthView = prevPass.depthView,
       .copySourceTexture = prevPass.copySourceTexture,
       .copySourceView = prevPass.copySourceView,
+      .copySourceDepthView = prevPass.copySourceDepthView,
       .targetSize = prevPass.targetSize,
       .msaaSamples = msaaSamples,
       .clearColorValue = clearColorValue,
@@ -311,7 +313,10 @@ uint32_t get_sample_count() noexcept {
   return g_renderPasses[g_currentRenderPass].msaaSamples;
 }
 
-void clear_offscreen_cache() { g_offscreenCache.clear(); }
+void clear_caches() noexcept {
+  g_offscreenCache.clear();
+  g_cachedBindGroups.clear();
+}
 
 static OffscreenCacheEntry get_offscreen_textures(uint32_t width, uint32_t height) {
   OffscreenCacheKey key{width, height};
@@ -377,6 +382,8 @@ void begin_offscreen(uint32_t width, uint32_t height) {
       g_renderPasses.pop_back();
       --g_currentRenderPass;
     }
+    g_suspendedEfbViewport = g_cachedViewport;
+    g_suspendedEfbScissor = g_cachedScissor;
   }
 
   // Create offscreen textures
@@ -390,6 +397,7 @@ void begin_offscreen(uint32_t width, uint32_t height) {
       .depthView = g_offscreenDepth.view,
       .copySourceTexture = g_offscreenColor.texture,
       .copySourceView = g_offscreenColor.view,
+      .copySourceDepthView = g_offscreenDepth.view,
       .targetSize = {width, height, 1},
       .msaaSamples = 1,
       .clearColorValue = {0.f, 0.f, 0.f, 0.f},
@@ -402,9 +410,10 @@ void begin_offscreen(uint32_t width, uint32_t height) {
 
   g_inOffscreen = true;
 
-  push_command(CommandType::SetViewport, Command::Data{.setViewport = {0.f, 0.f, static_cast<float>(width),
-                                                                       static_cast<float>(height), 0.f, 1.f}});
-  push_command(CommandType::SetScissor, Command::Data{.setScissor = {0, 0, width, height}});
+  g_cachedViewport = {0.f, 0.f, static_cast<float>(width), static_cast<float>(height), 0.f, 1.f};
+  g_cachedScissor = {0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)};
+  push_command(CommandType::SetViewport, Command::Data{.setViewport = g_cachedViewport});
+  push_command(CommandType::SetScissor, Command::Data{.setScissor = g_cachedScissor});
 }
 
 void end_offscreen() {
@@ -427,6 +436,8 @@ void end_offscreen() {
   ++g_currentRenderPass;
   set_efb_targets(g_renderPasses[g_currentRenderPass]);
 
+  g_cachedViewport = g_suspendedEfbViewport;
+  g_cachedScissor = g_suspendedEfbScissor;
   push_command(CommandType::SetViewport, Command::Data{.setViewport = g_cachedViewport});
   push_command(CommandType::SetScissor, Command::Data{.setScissor = g_cachedScissor});
 }
@@ -640,6 +651,9 @@ void begin_frame() {
   g_renderPasses[0].clearColorValue = gx::g_gxState.clearColor;
   g_renderPasses[0].clearDepthValue = gx::clear_depth_value();
   g_currentRenderPass = 0;
+  // Refresh render viewport/scissor from logical in case FB size changed
+  g_cachedViewport = gx::map_logical_viewport(gx::g_gxState.logicalViewport);
+  g_cachedScissor = gx::map_logical_scissor(gx::g_gxState.logicalScissor);
   push_command(CommandType::SetViewport, Command::Data{.setViewport = g_cachedViewport});
   push_command(CommandType::SetScissor, Command::Data{.setScissor = g_cachedScissor});
   begin_pipeline_frame();
@@ -762,9 +776,13 @@ void render(wgpu::CommandEncoder& cmd) {
       const bool needsConversion = tex_copy_conv::needs_conversion(passInfo.resolveFormat);
       const bool needsScaling = dstSize.width != static_cast<uint32_t>(passInfo.resolveRect.width) ||
                                 dstSize.height != static_cast<uint32_t>(passInfo.resolveRect.height);
+      const bool isDepth = gx::is_depth_format(passInfo.resolveFormat);
+      if (isDepth && passInfo.msaaSamples > 1) {
+        Log.fatal("Depth tex copies from multisampled EFB targets are not supported");
+      }
       const tex_copy_conv::ConvRequest convReq{
           .fmt = passInfo.resolveFormat,
-          .srcView = passInfo.copySourceView,
+          .srcView = isDepth ? passInfo.copySourceDepthView : passInfo.copySourceView,
           .uniformRange = passInfo.resolveUniformRange,
           .dst = passInfo.resolveTarget,
           .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
@@ -850,10 +868,10 @@ void render_pass(const wgpu::RenderPassEncoder& pass, u32 idx) {
     case CommandType::SetScissor: {
       const auto& sc = cmd.data.setScissor;
       const auto& size = g_renderPasses[idx].targetSize;
-      const auto x = std::clamp(sc.x, 0u, size.width);
-      const auto y = std::clamp(sc.y, 0u, size.height);
-      const auto w = std::clamp(sc.w, 0u, size.width - x);
-      const auto h = std::clamp(sc.h, 0u, size.height - y);
+      const auto x = std::clamp(static_cast<uint32_t>(sc.x), 0u, size.width);
+      const auto y = std::clamp(static_cast<uint32_t>(sc.y), 0u, size.height);
+      const auto w = std::clamp(static_cast<uint32_t>(sc.width), 0u, size.width - x);
+      const auto h = std::clamp(static_cast<uint32_t>(sc.height), 0u, size.height - y);
       pass.SetScissorRect(x, y, w, h);
     } break;
     case CommandType::Draw: {

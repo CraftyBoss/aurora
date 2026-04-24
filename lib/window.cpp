@@ -20,8 +20,11 @@
 #include <SDL3/SDL_stdinc.h>
 #include <SDL3/SDL_pixels.h>
 
-#include <cstdint>
+#include <algorithm>
+#include <cmath>
 #include <vector>
+
+#include "dolphin/vi/vi_internal.hpp"
 
 namespace aurora::window {
 namespace {
@@ -29,8 +32,7 @@ Module Log("aurora::window");
 
 SDL_Window* g_window;
 SDL_Renderer* g_renderer;
-bool g_aspectRatioLocked;
-int g_aspectRatioW, g_aspectRatioH;
+float g_frameBufferScale = 0.f;
 AuroraWindowSize g_windowSize;
 std::vector<AuroraEvent> g_events;
 
@@ -38,6 +40,27 @@ inline bool operator==(const AuroraWindowSize& lhs, const AuroraWindowSize& rhs)
   return lhs.width == rhs.width && lhs.height == rhs.height && lhs.fb_width == rhs.fb_width &&
          lhs.fb_height == rhs.fb_height && lhs.native_fb_height == rhs.native_fb_height &&
          lhs.native_fb_width == rhs.native_fb_width && lhs.scale == rhs.scale;
+}
+
+Vec2<int> scale_frame_buffer_to_aspect(int base_width, int base_height, float scale, float aspect) {
+  if (base_width <= 0 || base_height <= 0 || scale <= 0.f || aspect <= 0.f) {
+    return {std::max(base_width, 1), std::max(base_height, 1)};
+  }
+
+  const int scaled_base_width = std::max(1, static_cast<int>(std::lround(static_cast<float>(base_width) * scale)));
+  const int scaled_base_height = std::max(1, static_cast<int>(std::lround(static_cast<float>(base_height) * scale)));
+  const float base_aspect = static_cast<float>(base_width) / static_cast<float>(base_height);
+  if (aspect >= base_aspect) {
+    return {
+        std::max(1, static_cast<int>(std::lround(static_cast<float>(scaled_base_height) * aspect))),
+        scaled_base_height,
+    };
+  }
+
+  return {
+      scaled_base_width,
+      std::max(1, static_cast<int>(std::lround(static_cast<float>(scaled_base_width) / aspect))),
+  };
 }
 
 void resize_swapchain() noexcept {
@@ -74,6 +97,8 @@ const AuroraEvent* poll_events() {
   g_events.clear();
 
   SDL_Event event;
+  // Clear out the previous scroll values to prevent ghost input
+  input::set_mouse_scroll(0, 0);
   while (SDL_PollEvent(&event)) {
 #ifdef AURORA_ENABLE_GX
     imgui::process_event(event);
@@ -154,6 +179,9 @@ const AuroraEvent* poll_events() {
       });
       break;
     }
+    case SDL_EVENT_MOUSE_WHEEL:
+      input::set_mouse_scroll(event.wheel.x, event.wheel.y);
+      break;
     case SDL_EVENT_QUIT:
       g_events.push_back(AuroraEvent{
           .type = AURORA_EXIT,
@@ -334,19 +362,18 @@ AuroraWindowSize get_window_size() {
   int native_fb_w = 0;
   int native_fb_h = 0;
   ASSERT(SDL_GetWindowSize(g_window, &width, &height), "Failed to get window size: {}", SDL_GetError());
-  ASSERT(SDL_GetWindowSizeInPixels(g_window, &native_fb_w, &native_fb_h), "Failed to get window size in pixels: {}", SDL_GetError());
+  ASSERT(SDL_GetWindowSizeInPixels(g_window, &native_fb_w, &native_fb_h), "Failed to get window size in pixels: {}",
+         SDL_GetError());
 
   int fb_w = native_fb_w;
   int fb_h = native_fb_h;
-
-  if (g_aspectRatioLocked) {
-    // Try as if bounded on width.
-    fb_h = fb_w * g_aspectRatioH / g_aspectRatioW;
-    if (fb_h > native_fb_h) {
-      // Bounded on height instead.
-      fb_h = native_fb_h;
-      fb_w = fb_h * g_aspectRatioW / g_aspectRatioH;
-    }
+  if (g_frameBufferScale > 0.f) {
+    const auto [baseW, baseH] = vi::configured_fb_size();
+    const auto [scaledW, scaledH] =
+        scale_frame_buffer_to_aspect(static_cast<int>(baseW), static_cast<int>(baseH), g_frameBufferScale,
+                                     static_cast<float>(fb_w) / static_cast<float>(fb_h));
+    fb_w = scaledW;
+    fb_h = scaledH;
   }
 
   const float scale = SDL_GetWindowDisplayScale(g_window);
@@ -385,7 +412,8 @@ void set_window_position(uint32_t x, uint32_t y) {
 }
 
 void center_window() {
-  TRY_WARN(SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED), "Failed to center window: {}", SDL_GetError());
+  TRY_WARN(SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED),
+           "Failed to center window: {}", SDL_GetError());
 }
 
 static void push_future_resize_event() {
@@ -393,20 +421,18 @@ static void push_future_resize_event() {
   TRY_WARN(SDL_PushEvent(&event), "Failed to push SDL event for future resize: {}", SDL_GetError());
 }
 
-void lock_aspect_ratio(int width, int height) {
-  g_aspectRatioLocked = true;
-  g_aspectRatioW = width;
-  g_aspectRatioH = height;
-
-  // Defer so that we don't try to reconfigure the surface in the middle of game logic.
-  push_future_resize_event();
-}
-
-void unlock_aspect_ratio() {
-  g_aspectRatioLocked = false;
-
-  // Defer so that we don't try to reconfigure the surface in the middle of game logic.
-  push_future_resize_event();
+void set_frame_buffer_scale(float scale) {
+  if (scale < 0.f) {
+    scale = 0.f;
+  }
+  if (g_frameBufferScale == scale) {
+    return;
+  }
+  g_frameBufferScale = scale;
+  if (g_window != nullptr) {
+    // Defer so that we don't try to reconfigure the surface in the middle of game logic.
+    push_future_resize_event();
+  }
 }
 
 } // namespace aurora::window

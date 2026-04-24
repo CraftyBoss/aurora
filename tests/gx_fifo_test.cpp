@@ -1304,6 +1304,26 @@ TEST_F(GXFifoTest, LoadTexObjPcFormat_PreservesFullFormatMetadata) {
   EXPECT_EQ(slot.raw_format(), static_cast<u32>(GX_TF_RGBA8));
 }
 
+TEST_F(GXFifoTest, TexObjRawDimensions_WrapAtTenBitBoundary) {
+  auto& slot = gxState().loadedTextures[GX_TEXMAP0];
+  slot.image0 = (0x3FFu << 0) | (0x3FFu << 10);
+  slot.mWidth = 0;
+  slot.mHeight = 0;
+
+  EXPECT_EQ(slot.width(), 0u);
+  EXPECT_EQ(slot.height(), 0u);
+}
+
+TEST_F(GXFifoTest, TexObjExplicitDimensions_DoNotWrapAtTenBitBoundary) {
+  auto& slot = gxState().loadedTextures[GX_TEXMAP0];
+  slot.image0 = (0x3FFu << 0) | (0x3FFu << 10);
+  slot.mWidth = 1024;
+  slot.mHeight = 1024;
+
+  EXPECT_EQ(slot.width(), 1024u);
+  EXPECT_EQ(slot.height(), 1024u);
+}
+
 TEST_F(GXFifoTest, LoadTexObjCiAndTlut_PopulatesTextureAndTlutSlots) {
   alignas(32) u8 image[64]{};
   alignas(32) u16 palette[16]{};
@@ -1359,6 +1379,40 @@ TEST_F(GXFifoTest, DestroyTexObj_EmitsAuroraDestroyCommandAndClearsIdentity) {
   decode_fifo(bytes);
 }
 
+TEST_F(GXFifoTest, DestroyTexObj_MarksLoadedSlotNoCacheUntilReloaded) {
+  alignas(32) u8 imageA[64]{};
+  alignas(32) u8 imageB[64]{};
+  GXTexObj objA{};
+  GXTexObj objB{};
+
+  GXInitTexObj(&objA, imageA, 8, 8, GX_TF_RGB5A3, GX_REPEAT, GX_REPEAT, GX_FALSE);
+  GXLoadTexObj(&objA, GX_TEXMAP2);
+  auto loadABytes = capture_fifo();
+  const auto destroyedTexObjId = reinterpret_cast<const GXTexObj_*>(&objA)->texObjId;
+
+  GXDestroyTexObj(&objA);
+  auto destroyBytes = capture_fifo();
+
+  GXInitTexObj(&objB, imageB, 8, 8, GX_TF_RGB565, GX_CLAMP, GX_CLAMP, GX_FALSE);
+  GXLoadTexObj(&objB, GX_TEXMAP2);
+  auto loadBBytes = capture_fifo();
+
+  reset_gx_state();
+  decode_fifo(loadABytes);
+  auto& slot = gxState().loadedTextures[GX_TEXMAP2];
+  EXPECT_EQ(slot.texObjId, destroyedTexObjId);
+  EXPECT_FALSE(slot.no_cache());
+
+  decode_fifo(destroyBytes);
+  EXPECT_EQ(slot.texObjId, destroyedTexObjId);
+  EXPECT_TRUE(slot.no_cache());
+
+  decode_fifo(loadBBytes);
+  EXPECT_EQ(slot.data, imageB);
+  EXPECT_EQ(slot.format(), GX_TF_RGB565);
+  EXPECT_FALSE(slot.no_cache());
+}
+
 TEST_F(GXFifoTest, DestroyTlutObj_EmitsAuroraDestroyCommandAndClearsIdentity) {
   alignas(32) u16 palette[16]{};
   GXTlutObj obj{};
@@ -1371,6 +1425,40 @@ TEST_F(GXFifoTest, DestroyTlutObj_EmitsAuroraDestroyCommandAndClearsIdentity) {
 
   reset_gx_state();
   decode_fifo(bytes);
+}
+
+TEST_F(GXFifoTest, DestroyTlutObj_MarksLoadedSlotNoCacheUntilReloaded) {
+  alignas(32) u16 paletteA[16]{};
+  alignas(32) u16 paletteB[16]{};
+  GXTlutObj objA{};
+  GXTlutObj objB{};
+
+  GXInitTlutObj(&objA, paletteA, GX_TL_RGB565, 16);
+  GXLoadTlut(&objA, GX_TLUT3);
+  auto loadABytes = capture_fifo();
+  const auto destroyedTlutObjId = reinterpret_cast<const GXTlutObj_*>(&objA)->tlutObjId;
+
+  GXDestroyTlutObj(&objA);
+  auto destroyBytes = capture_fifo();
+
+  GXInitTlutObj(&objB, paletteB, GX_TL_IA8, 16);
+  GXLoadTlut(&objB, GX_TLUT3);
+  auto loadBBytes = capture_fifo();
+
+  reset_gx_state();
+  decode_fifo(loadABytes);
+  auto& slot = gxState().loadedTluts[GX_TLUT3];
+  EXPECT_EQ(slot.tlutObjId, destroyedTlutObjId);
+  EXPECT_FALSE(slot.no_cache());
+
+  decode_fifo(destroyBytes);
+  EXPECT_EQ(slot.tlutObjId, destroyedTlutObjId);
+  EXPECT_TRUE(slot.no_cache());
+
+  decode_fifo(loadBBytes);
+  EXPECT_EQ(slot.data, paletteB);
+  EXPECT_EQ(slot.format, GX_TL_IA8);
+  EXPECT_FALSE(slot.no_cache());
 }
 
 // ============================================================================
@@ -1963,6 +2051,22 @@ TEST_F(GXFifoTest, GetProjectionAndScissorShadowState) {
   EXPECT_EQ(height, 240u);
 }
 
+TEST_F(GXFifoTest, Scissor_EncodesBpAndDecodesLogicalState) {
+  GXSetScissor(16, 24, 320, 240);
+  auto bytes = capture_fifo();
+
+  EXPECT_TRUE(has_bp_write(bytes, 0x20));
+  EXPECT_TRUE(has_bp_write(bytes, 0x21));
+
+  reset_gx_state();
+  decode_fifo(bytes);
+
+  EXPECT_EQ(g_gxState.logicalScissor.x, 16);
+  EXPECT_EQ(g_gxState.logicalScissor.y, 24);
+  EXPECT_EQ(g_gxState.logicalScissor.width, 320);
+  EXPECT_EQ(g_gxState.logicalScissor.height, 240);
+}
+
 TEST_F(GXFifoTest, GetViewportShadowState) {
   f32 vp[6]{};
 
@@ -1983,6 +2087,53 @@ TEST_F(GXFifoTest, GetViewportShadowState) {
   EXPECT_FLOAT_EQ(vp[3], 240.0f);
   EXPECT_FLOAT_EQ(vp[4], 0.2f);
   EXPECT_FLOAT_EQ(vp[5], 0.9f);
+}
+
+TEST_F(GXFifoTest, Viewport_DecodesLogicalViewportState) {
+  GXSetViewport(10.0f, 20.0f, 640.0f, 480.0f, 0.1f, 1.0f);
+  auto bytes = capture_fifo();
+
+  reset_gx_state();
+  decode_fifo(bytes);
+
+  EXPECT_FLOAT_EQ(g_gxState.logicalViewport.left, 10.0f);
+  EXPECT_FLOAT_EQ(g_gxState.logicalViewport.top, 20.0f);
+  EXPECT_FLOAT_EQ(g_gxState.logicalViewport.width, 640.0f);
+  EXPECT_FLOAT_EQ(g_gxState.logicalViewport.height, 480.0f);
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.left, 10.0f);
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.top, 20.0f);
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.width, 640.0f);
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.height, 480.0f);
+}
+
+TEST_F(GXFifoTest, ViewportRender_EncodesAuroraOverride) {
+  GXSetViewportRender(100.0f, 50.0f, 1280.0f, 720.0f, 0.0f, 1.0f);
+  auto bytes = capture_fifo();
+
+  EXPECT_TRUE(has_aurora_cmd(bytes, GX_LOAD_AURORA_VIEWPORT_RENDER));
+
+  reset_gx_state();
+  decode_fifo(bytes);
+
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.left, 100.0f);
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.top, 50.0f);
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.width, 1280.0f);
+  EXPECT_FLOAT_EQ(g_gxState.renderViewport.height, 720.0f);
+}
+
+TEST_F(GXFifoTest, ScissorRender_EncodesAuroraOverride) {
+  GXSetScissorRender(100, 40, 800, 600);
+  auto bytes = capture_fifo();
+
+  EXPECT_TRUE(has_aurora_cmd(bytes, GX_LOAD_AURORA_SCISSOR_RENDER));
+
+  reset_gx_state();
+  decode_fifo(bytes);
+
+  EXPECT_EQ(g_gxState.renderScissor.x, 100);
+  EXPECT_EQ(g_gxState.renderScissor.y, 40);
+  EXPECT_EQ(g_gxState.renderScissor.width, 800);
+  EXPECT_EQ(g_gxState.renderScissor.height, 600);
 }
 
 // --- GXLoadLightObjImm (XF 0x600-0x67F) ---

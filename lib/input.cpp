@@ -138,4 +138,32 @@ void initialize() noexcept {
   ASSERT(SDL_Init(SDL_INIT_HAPTIC | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD), "Failed to initialize SDL subsystems: {}",
          SDL_GetError());
 }
+
+struct MouseScrollStatus {
+  float scrollX;
+  float scrollY;
+};
+
+static MouseScrollStatus g_MouseStatus;
+
+void set_mouse_scroll(const float scrollX, const float scrollY) noexcept {
+  g_MouseStatus.scrollX = scrollX;
+  g_MouseStatus.scrollY = scrollY;
+}
+
+void get_mouse_scroll(float* scrollX, float* scrollY) noexcept {
+  *scrollX = g_MouseStatus.scrollX;
+  *scrollY = g_MouseStatus.scrollY;
+}
+
+void shutdown() noexcept {
+  // Upon shutdown we want to ensure all controllers are in a default state, so force all rumble supporting controllers
+  // to shut off their rumble motors. 
+  for (const auto& controller : g_GameControllers) {
+    if (!controller.second.m_hasRumble) {
+      continue;
+    }
+    controller_rumble(controller.first, 0, 0, 0);
+  }
+}
 } // namespace aurora::input

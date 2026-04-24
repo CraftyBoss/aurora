@@ -1,6 +1,7 @@
 #include "gx.hpp"
 
 #include "pipeline.hpp"
+#include "../dolphin/vi/vi_internal.hpp"
 #include "../webgpu/gpu.hpp"
 #include "../internal.hpp"
 #include "../gfx/common.hpp"
@@ -120,13 +121,6 @@ void store_cached_texture(const GXTexObj_& obj, gfx::TextureHandle handle, u32 t
   }
 }
 
-u32 mip_count_for(const GXTexObj_& obj) {
-  if (!obj.has_mips()) {
-    return 1;
-  }
-  return std::max<u32>(static_cast<u32>(obj.max_lod()) + 1, 1u);
-}
-
 gfx::TextureHandle get_tlut_texture(const GXTlutObj_& tlut) {
   if (tlut.tlutObjId != 0) {
     auto& cache = s_tlutObjectCaches[tlut.tlutObjId];
@@ -167,10 +161,13 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
   if (const auto replacement = gfx::texture_replacement::find_replacement(obj); replacement.has_value()) {
     handle = *replacement;
   } else {
-    handle = gfx::new_static_texture_2d(obj.width(), obj.height(), mip_count_for(obj), obj.format(),
-                                        {static_cast<const u8*>(obj.data), obj.dataSize}, false, "GX Static Texture");
+    handle =
+        gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
+                                   {static_cast<const uint8_t*>(obj.data), UINT32_MAX}, false, "GX Static Texture");
   }
-  store_cached_texture(obj, handle);
+  if (!obj.no_cache()) {
+    store_cached_texture(obj, handle);
+  }
   return handle;
 }
 
@@ -191,16 +188,20 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
   if (const auto replacement = gfx::texture_replacement::find_replacement(obj); replacement.has_value()) {
     handle = *replacement;
   } else {
-    auto decoded = gfx::convert_texture_palette(
-        obj.format(), obj.width(), obj.height(), mip_count_for(obj), {static_cast<const u8*>(obj.data), obj.dataSize},
+    auto converted = gfx::convert_texture_palette(
+        obj.format(), obj.width(), obj.height(), obj.mip_count(), {static_cast<const u8*>(obj.data), UINT32_MAX},
         tlut.format, tlut.numEntries, {static_cast<const u8*>(tlut.data), static_cast<size_t>(tlut.numEntries) * 2});
-    if (decoded.empty()) {
+    if (converted.data.empty()) {
       return {};
     }
-    handle = gfx::new_static_texture_2d(obj.width(), obj.height(), mip_count_for(obj), GX_TF_RGBA8_PC,
-                                        {decoded.data(), decoded.size()}, false, "GX Static Palette Texture");
+    handle =
+        gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), GX_TF_RGBA8_PC,
+                                   {converted.data.data(), converted.data.size()}, false, "GX Static Palette Texture");
+    handle->hasArbitraryMips = converted.hasArbitraryMips;
   }
-  store_cached_texture(obj, handle, tlut.tlutObjId, tlut.tlutDataVersion);
+  if (!obj.no_cache() && !tlut.no_cache()) {
+    store_cached_texture(obj, handle, tlut.tlutObjId, tlut.tlutDataVersion);
+  }
   return handle;
 }
 
@@ -241,12 +242,116 @@ u32 resolved_format_for_handle(const gfx::TextureHandle& handle) {
 }
 } // namespace
 
+Vec2<uint32_t> logical_fb_size() noexcept {
+  return gfx::is_offscreen() ? gfx::get_render_target_size() : vi::configured_fb_size();
+}
+
+gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept {
+  if (g_gxState.viewportPolicy == AURORA_VIEWPORT_NATIVE) {
+    return logicalViewport;
+  }
+
+  const auto [logicalFbWidth, logicalFbHeight] = logical_fb_size();
+  const auto [targetWidth, targetHeight] = gfx::get_render_target_size();
+  if (logicalFbWidth == 0 || logicalFbHeight == 0 || targetWidth == 0 || targetHeight == 0) {
+    return logicalViewport;
+  }
+
+  const bool stretch = g_gxState.viewportPolicy == AURORA_VIEWPORT_STRETCH;
+  const float scaleX = static_cast<float>(targetWidth) / static_cast<float>(logicalFbWidth);
+  const float scaleY = static_cast<float>(targetHeight) / static_cast<float>(logicalFbHeight);
+  const float scale = std::min(scaleX, scaleY);
+  const float xOffset =
+      stretch ? 0.f : (static_cast<float>(targetWidth) - static_cast<float>(logicalFbWidth) * scale) * 0.5f;
+  const float yOffset =
+      stretch ? 0.f : (static_cast<float>(targetHeight) - static_cast<float>(logicalFbHeight) * scale) * 0.5f;
+  const float mappedScaleX = stretch ? scaleX : scale;
+  const float mappedScaleY = stretch ? scaleY : scale;
+  return {
+      .left = xOffset + logicalViewport.left * mappedScaleX,
+      .top = yOffset + logicalViewport.top * mappedScaleY,
+      .width = logicalViewport.width * mappedScaleX,
+      .height = logicalViewport.height * mappedScaleY,
+      .znear = logicalViewport.znear,
+      .zfar = logicalViewport.zfar,
+  };
+}
+
+gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept {
+  if (g_gxState.viewportPolicy == AURORA_VIEWPORT_NATIVE) {
+    return logicalScissor;
+  }
+
+  const auto [logicalFbWidth, logicalFbHeight] = logical_fb_size();
+  const auto [targetWidth, targetHeight] = gfx::get_render_target_size();
+  if (logicalFbWidth == 0 || logicalFbHeight == 0 || targetWidth == 0 || targetHeight == 0) {
+    return logicalScissor;
+  }
+
+  const bool stretch = g_gxState.viewportPolicy == AURORA_VIEWPORT_STRETCH;
+  const float scaleX = static_cast<float>(targetWidth) / static_cast<float>(logicalFbWidth);
+  const float scaleY = static_cast<float>(targetHeight) / static_cast<float>(logicalFbHeight);
+  const float scale = std::min(scaleX, scaleY);
+  const float xOffset =
+      stretch ? 0.f : (static_cast<float>(targetWidth) - static_cast<float>(logicalFbWidth) * scale) * 0.5f;
+  const float yOffset =
+      stretch ? 0.f : (static_cast<float>(targetHeight) - static_cast<float>(logicalFbHeight) * scale) * 0.5f;
+  const float mappedScaleX = stretch ? scaleX : scale;
+  const float mappedScaleY = stretch ? scaleY : scale;
+
+  const float left = xOffset + static_cast<float>(logicalScissor.x) * mappedScaleX;
+  const float top = yOffset + static_cast<float>(logicalScissor.y) * mappedScaleY;
+  const float right = xOffset + static_cast<float>(logicalScissor.x + logicalScissor.width) * mappedScaleX;
+  const float bottom = yOffset + static_cast<float>(logicalScissor.y + logicalScissor.height) * mappedScaleY;
+
+  const auto mappedLeft = std::clamp(static_cast<int32_t>(std::floor(left)), 0, static_cast<int32_t>(targetWidth));
+  const auto mappedTop = std::clamp(static_cast<int32_t>(std::floor(top)), 0, static_cast<int32_t>(targetHeight));
+  const auto mappedRight =
+      std::clamp(static_cast<int32_t>(std::ceil(right)), mappedLeft, static_cast<int32_t>(targetWidth));
+  const auto mappedBottom =
+      std::clamp(static_cast<int32_t>(std::ceil(bottom)), mappedTop, static_cast<int32_t>(targetHeight));
+
+  return {
+      .x = mappedLeft,
+      .y = mappedTop,
+      .width = mappedRight - mappedLeft,
+      .height = mappedBottom - mappedTop,
+  };
+}
+
+void set_logical_viewport(const gfx::Viewport& viewport) noexcept {
+  g_gxState.logicalViewport = viewport;
+  set_render_viewport(map_logical_viewport(viewport));
+}
+
+void set_render_viewport(const gfx::Viewport& viewport) noexcept {
+  g_gxState.renderViewport = viewport;
+  gfx::set_viewport(viewport);
+}
+
+void set_logical_scissor(const gfx::ClipRect& scissor) noexcept {
+  g_gxState.logicalScissor = scissor;
+  set_render_scissor(map_logical_scissor(g_gxState.logicalScissor));
+}
+
+void set_render_scissor(const gfx::ClipRect& scissor) noexcept {
+  g_gxState.renderScissor = scissor;
+  gfx::set_scissor(scissor);
+}
+
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.textures[static_cast<size_t>(id)]; }
 
 void evict_texture_object(u32 texObjId) noexcept {
   if (const auto it = s_textureObjectCaches.find(texObjId); it != s_textureObjectCaches.end()) {
     clear_texture_dependency(texObjId, it->second.tlutObjId);
     s_textureObjectCaches.erase(it);
+  }
+  // If there is a loaded slot with this ID, mark it as no_cache to avoid inserting it when it's resolved.
+  // This also handles the case where the texture was created, loaded, and immediately destroyed before we resolved it.
+  for (auto& obj : g_gxState.loadedTextures) {
+    if (obj.texObjId == texObjId) {
+      obj.set_no_cache(true);
+    }
   }
 }
 
@@ -256,6 +361,13 @@ void evict_tlut_object(u32 tlutObjId) noexcept {
       s_textureObjectCaches.erase(texObjId);
     }
     s_tlutObjectCaches.erase(it);
+  }
+  // If there is a loaded slot with this ID, mark it as no_cache to avoid inserting it when it's resolved.
+  // This also handles the case where the texture was created, loaded, and immediately destroyed before we resolved it.
+  for (auto& obj : g_gxState.loadedTluts) {
+    if (obj.tlutObjId == tlutObjId) {
+      obj.set_no_cache(true);
+    }
   }
 }
 
@@ -277,7 +389,8 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
 
     GXTexObj_ obj = g_gxState.loadedTextures[i];
     auto& textureBind = g_gxState.textures[i];
-    if (obj.texObjId == textureBind.texObj.texObjId && obj.texDataVersion == textureBind.texObj.texDataVersion) {
+    if (obj.texObjId != 0 && obj.texObjId == textureBind.texObj.texObjId &&
+        obj.texDataVersion == textureBind.texObj.texDataVersion) {
       // Texture bind unchanged
       continue;
     }
@@ -850,9 +963,9 @@ static std::pair<wgpu::FilterMode, wgpu::MipmapFilterMode> wgpu_filter_mode(GXTe
   switch (filter) {
     DEFAULT_FATAL("invalid filter mode {}", static_cast<int>(filter));
   case GX_NEAR:
-    return {wgpu::FilterMode::Nearest, wgpu::MipmapFilterMode::Linear};
+    return {wgpu::FilterMode::Nearest, wgpu::MipmapFilterMode::Undefined};
   case GX_LINEAR:
-    return {wgpu::FilterMode::Linear, wgpu::MipmapFilterMode::Linear};
+    return {wgpu::FilterMode::Linear, wgpu::MipmapFilterMode::Undefined};
   case GX_NEAR_MIP_NEAR:
     return {wgpu::FilterMode::Nearest, wgpu::MipmapFilterMode::Nearest};
   case GX_LIN_MIP_NEAR:
@@ -880,6 +993,12 @@ static u16 wgpu_aniso(GXAnisotropy aniso) {
 wgpu::SamplerDescriptor aurora::gfx::TextureBind::get_descriptor() const noexcept {
   const auto [minFilter, mipFilter] = wgpu_filter_mode(texObj.min_filter());
   const auto [magFilter, _] = wgpu_filter_mode(texObj.mag_filter());
+  float minLod = texObj.min_lod();
+  float maxLod = texObj.max_lod();
+  if (mipFilter == wgpu::MipmapFilterMode::Undefined) {
+    minLod = 0.f;
+    maxLod = 0.f;
+  }
   return {
       .label = "Generated Filtering Sampler",
       .addressModeU = wgpu_address_mode(texObj.wrap_s()),
@@ -888,6 +1007,8 @@ wgpu::SamplerDescriptor aurora::gfx::TextureBind::get_descriptor() const noexcep
       .magFilter = magFilter,
       .minFilter = minFilter,
       .mipmapFilter = mipFilter,
+      .lodMinClamp = minLod,
+      .lodMaxClamp = maxLod,
       .maxAnisotropy = wgpu_aniso(texObj.max_aniso()),
   };
 } // namespace aurora::gx

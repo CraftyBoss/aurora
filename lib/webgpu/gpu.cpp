@@ -12,6 +12,7 @@
 #include <webgpu/webgpu.h>
 #include <webgpu/webgpu_cpp.h>
 
+#include "../gfx/common.hpp"
 #include "../internal.hpp"
 #include "../window.hpp"
 
@@ -63,7 +64,8 @@ static wgpu::PresentMode best_present_mode(bool vsync) {
       return wgpu::PresentMode::FifoRelaxed;
     }
   } else {
-    if (supports(wgpu::PresentMode::Mailbox)) {
+    // Dawn only disables CAMetalLayer displaySyncEnabled for Immediate on Metal
+    if (g_backendType != wgpu::BackendType::Metal && supports(wgpu::PresentMode::Mailbox)) {
       return wgpu::PresentMode::Mailbox;
     }
     if (supports(wgpu::PresentMode::Immediate)) {
@@ -465,13 +467,21 @@ bool initialize(AuroraBackend auroraBackend) {
         requiredLimits.maxTextureDimension3D, requiredLimits.maxTextureArrayLayers,
         requiredLimits.maxDynamicStorageBuffersPerPipelineLayout, requiredLimits.maxStorageBuffersPerShaderStage,
         requiredLimits.minUniformBufferOffsetAlignment, requiredLimits.minStorageBufferOffsetAlignment);
-    std::vector requiredFeatures{wgpu::FeatureName::TextureComponentSwizzle};
+    std::vector<wgpu::FeatureName> requiredFeatures;
+    wgpu::SupportedFeatures supportedFeatures;
+    g_adapter.GetFeatures(&supportedFeatures);
+    for (size_t i = 0; i < supportedFeatures.featureCount; ++i) {
+      const auto feature = supportedFeatures.features[i];
+      if (feature == wgpu::FeatureName::TextureCompressionBC) {
+        requiredFeatures.push_back(feature);
+      }
+    }
 #ifdef WEBGPU_DAWN
     wgpu::DawnCacheDeviceDescriptor cacheDescriptor({
-      .isolationKey = nullptr,
-      .loadDataFunction = load_from_cache,
-      .storeDataFunction = store_to_cache,
-      .functionUserdata = nullptr,
+        .isolationKey = nullptr,
+        .loadDataFunction = load_from_cache,
+        .storeDataFunction = store_to_cache,
+        .functionUserdata = nullptr,
     });
 
     constexpr std::array enableToggles{
@@ -591,7 +601,7 @@ bool initialize(AuroraBackend auroraBackend) {
       .textureAnisotropy = g_config.maxTextureAnisotropy,
   };
   create_copy_pipeline();
-  resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_width, true);
+  resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
   return true;
 }
 
@@ -647,7 +657,7 @@ void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, ui
   }
   if (sizeChanged) {
     gx::clear_copy_texture_cache();
-    gfx::clear_offscreen_cache();
+    gfx::clear_caches();
   }
   g_graphicsConfig.surfaceConfiguration.width = native_width;
   g_graphicsConfig.surfaceConfiguration.height = native_height;
